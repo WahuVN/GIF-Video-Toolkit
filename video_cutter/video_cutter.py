@@ -22,13 +22,22 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import shutil
 import subprocess
 import sys
 import time
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from media_runtime import (
+    CancelledError, CancellationToken, discover_media_tool, estimate_precise_bytes,
+    estimate_stream_copy_bytes, terminate_process,
+)
 
 
 ProgressCallback = Callable[[float, str], None]
@@ -40,24 +49,17 @@ ProgressCallback = Callable[[float, str], None]
 # ---------------------------------------------------------------------------
 
 
-def _ffmpeg_exe() -> str:
-    """Trả về đường dẫn ffmpeg. Ưu tiên ffmpeg trên PATH, fallback imageio-ffmpeg."""
-    found = shutil.which("ffmpeg")
-    if found:
-        return found
+def _ffmpeg_exe(configured: Optional[str] = None) -> str:
+    """Tìm ffmpeg theo configured/env/PATH/imageio và xác minh executable."""
+    return discover_media_tool("ffmpeg", configured=configured, allow_imageio=True)
+
+
+def _ffprobe_exe(configured: Optional[str] = None) -> Optional[str]:
+    """Tìm ffprobe theo configured/env/PATH; trả None để fallback ffmpeg."""
     try:
-        import imageio_ffmpeg  # type: ignore
-
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception as exc:
-        raise RuntimeError(
-            "Không tìm thấy ffmpeg. Cài gói: pip install imageio-ffmpeg"
-        ) from exc
-
-
-def _ffprobe_exe() -> Optional[str]:
-    """Trả về đường dẫn ffprobe nếu có, ngược lại None (sẽ fallback dùng ffmpeg)."""
-    return shutil.which("ffprobe")
+        return discover_media_tool("ffprobe", configured=configured, allow_imageio=False)
+    except RuntimeError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +236,7 @@ class CutOptions:
     crf: int = 20
     preset: str = "medium"
     overwrite: bool = True
+    ffmpeg_path: Optional[str] = None
 
 
 def _validate(opts: CutOptions) -> None:
@@ -285,11 +288,26 @@ def _build_cmd(opts: CutOptions, ffmpeg: str) -> List[str]:
 _TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
 
 
-def cut_video(opts: CutOptions, on_progress: Optional[ProgressCallback] = None) -> Path:
+def estimate_cut_size(opts: CutOptions, info: Optional[VideoInfo] = None) -> int:
+    """Ước lượng dung lượng trước encode; chỉ dùng để lập kế hoạch."""
+    info = info or probe(opts.input_path)
+    clip_duration = max(0.0, opts.end - opts.start)
+    if opts.mode == "copy":
+        return estimate_stream_copy_bytes(opts.input_path.stat().st_size, info.duration, clip_duration)
+    return estimate_precise_bytes(
+        clip_duration, crf=opts.crf, keep_audio=opts.keep_audio,
+        width=info.width or 1920, height=info.height or 1080, fps=info.fps or 30.0,
+    )
+
+
+def cut_video(opts: CutOptions, on_progress: Optional[ProgressCallback] = None,
+              cancel_token: Optional[CancellationToken] = None) -> Path:
     _validate(opts)
     opts.output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    ffmpeg = _ffmpeg_exe()
+    token = cancel_token or CancellationToken()
+    token.raise_if_cancelled()
+    ffmpeg = _ffmpeg_exe(opts.ffmpeg_path)
     cmd = _build_cmd(opts, ffmpeg)
 
     duration = max(1e-3, opts.end - opts.start)
@@ -306,20 +324,40 @@ def cut_video(opts: CutOptions, on_progress: Optional[ProgressCallback] = None) 
         bufsize=1,
     )
 
+    def cancel_watcher() -> None:
+        while proc.poll() is None:
+            if token.cancelled:
+                terminate_process(proc)
+                return
+            time.sleep(0.05)
+
+    watcher = threading.Thread(target=cancel_watcher, daemon=True, name="ffmpeg-cancel-watch")
+    watcher.start()
+
     last_lines: List[str] = []
     assert proc.stdout is not None
-    for line in proc.stdout:
-        last_lines.append(line.rstrip())
-        if len(last_lines) > 80:
-            del last_lines[0]
-        m = _TIME_RE.search(line)
-        if m and on_progress:
-            h, mm, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
-            elapsed = h * 3600 + mm * 60 + s
-            frac = max(0.0, min(0.99, elapsed / duration))
-            on_progress(frac, f"Đã xử lý {format_time(elapsed)} / {format_time(duration)}")
-
-    proc.wait()
+    try:
+        for line in proc.stdout:
+            token.raise_if_cancelled()
+            last_lines.append(line.rstrip())
+            if len(last_lines) > 80:
+                del last_lines[0]
+            m = _TIME_RE.search(line)
+            if m and on_progress:
+                h, mm, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
+                elapsed = h * 3600 + mm * 60 + s
+                frac = max(0.0, min(0.99, elapsed / duration))
+                on_progress(frac, f"Đã xử lý {format_time(elapsed)} / {format_time(duration)}")
+        token.raise_if_cancelled()
+        proc.wait()
+    except CancelledError:
+        terminate_process(proc)
+        try:
+            if opts.output_path.exists():
+                opts.output_path.unlink()
+        except OSError:
+            pass
+        raise
     if proc.returncode != 0:
         tail = "\n".join(last_lines[-20:])
         raise RuntimeError(f"ffmpeg lỗi (mã {proc.returncode}):\n{tail}")

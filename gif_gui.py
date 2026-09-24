@@ -38,12 +38,14 @@ from gif_tool import (
     BuildConfig,
     BuildResult,
     build_gif,
+    estimate_gif_size,
     default_output_path,
     discover_input_kind,
     parse_background,
     parse_timecode,
     quality_to_colors,
 )
+from media_job_queue import JobSnapshot, SerialJobQueue
 
 # tkinterdnd2 là tùy chọn: nếu có thì bật kéo thả, không có thì vẫn chạy bình thường.
 try:
@@ -395,6 +397,7 @@ class App(_BaseTk):  # type: ignore[misc, valid-type]
 
         self._queue: "queue.Queue[tuple]" = queue.Queue()
         self._worker: Optional[threading.Thread] = None
+        self._job_queue = SerialJobQueue(lambda snap: self._queue.put(("job_state", snap)))
         self._media: Optional[MediaSource] = None
         self._preview_imgtk: Optional[ImageTk.PhotoImage] = None
 
@@ -696,10 +699,12 @@ class App(_BaseTk):  # type: ignore[misc, valid-type]
         action = ttk.Frame(right)
         action.grid(row=4, column=0, sticky="ew", pady=(8, 4))
 
-        self.btn_run = ttk.Button(action, text="▶  Tạo GIF", command=self._on_run)
+        self.btn_run = ttk.Button(action, text="＋  Thêm vào hàng đợi", command=self._on_run)
         self.btn_run.pack(side="left", padx=2)
         self.btn_open = ttk.Button(action, text="📁  Mở thư mục kết quả", command=self._open_output_folder, state="disabled")
         self.btn_open.pack(side="left", padx=6)
+        self.btn_cancel_job = ttk.Button(action, text="■  Hủy tác vụ chọn", command=self._cancel_selected_job)
+        self.btn_cancel_job.pack(side="left", padx=2)
         ttk.Button(action, text="↺  Đặt lại form", command=self._reset_form).pack(side="right", padx=2)
 
         self.progress = ttk.Progressbar(right, mode="determinate")
@@ -708,12 +713,27 @@ class App(_BaseTk):  # type: ignore[misc, valid-type]
         self.var_status = tk.StringVar(value="Sẵn sàng")
         ttk.Label(right, textvariable=self.var_status).grid(row=6, column=0, sticky="ew", pady=(2, 6))
 
+        # Hàng đợi tác vụ
+        queue_frame = ttk.LabelFrame(root, text="Hàng đợi tác vụ")
+        queue_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        queue_frame.columnconfigure(0, weight=1)
+        self.job_tree = ttk.Treeview(queue_frame, columns=("status", "progress", "message"), show="tree headings", height=4)
+        self.job_tree.heading("#0", text="Tác vụ")
+        self.job_tree.heading("status", text="Trạng thái")
+        self.job_tree.heading("progress", text="Tiến độ")
+        self.job_tree.heading("message", text="Chi tiết")
+        self.job_tree.column("#0", width=260)
+        self.job_tree.column("status", width=90, anchor="center")
+        self.job_tree.column("progress", width=80, anchor="center")
+        self.job_tree.column("message", width=420)
+        self.job_tree.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
+
         # Log
         log_frame = ttk.LabelFrame(root, text="Nhật ký")
-        log_frame.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+        log_frame.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
-        root.rowconfigure(2, weight=0)
+        root.rowconfigure(3, weight=0)
         self.txt_log = tk.Text(log_frame, height=8, wrap="word")
         self.txt_log.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
         self.txt_log.configure(state="disabled")
@@ -872,7 +892,7 @@ class App(_BaseTk):  # type: ignore[misc, valid-type]
         self.range_slider.set_cursor(0.0)
 
         self.var_start.set("0")
-        self.var_end.set(f"{duration:.2f}")
+        self.var_end.set(f"{duration:.3f}")
         self._update_clip_info()
         self._show_frame_at(0.0)
         self._update_time_label()
@@ -928,8 +948,8 @@ class App(_BaseTk):  # type: ignore[misc, valid-type]
         # Cập nhật vào các ô text mà không gây vòng phản hồi.
         self._suspend_text_trace = True
         try:
-            self.var_start.set(f"{lo:.2f}")
-            self.var_end.set(f"{hi:.2f}")
+            self.var_start.set(f"{lo:.3f}")
+            self.var_end.set(f"{hi:.3f}")
         finally:
             self._suspend_text_trace = False
         self._update_clip_info()
@@ -993,7 +1013,7 @@ class App(_BaseTk):  # type: ignore[misc, valid-type]
         lo, hi = self.range_slider.get_range()
         new_lo = min(self._cursor_time, hi - 1e-3)
         self.range_slider.set_range(new_lo, hi)
-        self.var_start.set(f"{new_lo:.2f}")
+        self.var_start.set(f"{new_lo:.3f}")
         self._update_clip_info()
         self.var_status.set(f"Đã đặt điểm vào tại {_format_time(new_lo)}.")
 
@@ -1004,7 +1024,7 @@ class App(_BaseTk):  # type: ignore[misc, valid-type]
         lo, hi = self.range_slider.get_range()
         new_hi = max(self._cursor_time, lo + 1e-3)
         self.range_slider.set_range(lo, new_hi)
-        self.var_end.set(f"{new_hi:.2f}")
+        self.var_end.set(f"{new_hi:.3f}")
         self._update_clip_info()
         self.var_status.set(f"Đã đặt điểm ra tại {_format_time(new_hi)}.")
 
@@ -1308,8 +1328,6 @@ class App(_BaseTk):  # type: ignore[misc, valid-type]
         )
 
     def _on_run(self) -> None:
-        if self._worker and self._worker.is_alive():
-            return
         try:
             cfg = self._build_config()
         except Exception as exc:
@@ -1317,22 +1335,49 @@ class App(_BaseTk):  # type: ignore[misc, valid-type]
             return
 
         self._stop_play()
-        self.btn_run.configure(state="disabled")
         self.btn_open.configure(state="disabled")
         self.progress.configure(value=0)
-        self._log_clear()
-        self._log(f"Đang tạo GIF: {cfg.output_path}")
-        self.var_status.set("Đang xử lý…")
+        estimate = None
+        if self._media is not None:
+            estimate = estimate_gif_size(cfg, self._media.width, self._media.height, self._media.duration)
+        label = f"GIF · {cfg.input_path.name} → {cfg.output_path.name}"
 
-        def worker() -> None:
-            try:
-                result = build_gif(cfg, on_progress=self._on_progress)
-                self._queue.put(("done", cfg, result))
-            except Exception:
-                self._queue.put(("error", traceback.format_exc()))
+        def runner(token, progress) -> None:
+            def on_progress(stage: str, fraction: float, message: str) -> None:
+                progress(fraction, f"[{_translate_stage(stage)}] {_translate_message(message)}")
+            result = build_gif(cfg, on_progress=on_progress, cancel_token=token)
+            self._queue.put(("job_result", cfg, result))
 
-        self._worker = threading.Thread(target=worker, daemon=True)
-        self._worker.start()
+        job_id = self._job_queue.submit(label, runner)
+        if estimate:
+            self._log(f"Đã xếp {job_id}: {label} · ước lượng ≈ {estimate / (1024 * 1024):.2f} MB")
+        else:
+            self._log(f"Đã xếp {job_id}: {label}")
+        self.var_status.set("Đã thêm tác vụ vào hàng đợi")
+
+    def _cancel_selected_job(self) -> None:
+        selected = self.job_tree.selection()
+        if not selected:
+            self.var_status.set("Chọn một tác vụ trong hàng đợi để hủy.")
+            return
+        self._job_queue.cancel(selected[0])
+
+    def _upsert_job(self, snap: JobSnapshot) -> None:
+        status_vi = {"queued":"Chờ", "running":"Đang chạy", "done":"Xong", "failed":"Lỗi", "cancelled":"Đã hủy"}.get(snap.status, snap.status)
+        values = (status_vi, f"{snap.progress * 100:.0f}%", snap.message)
+        if self.job_tree.exists(snap.id):
+            self.job_tree.item(snap.id, text=snap.label, values=values)
+        else:
+            self.job_tree.insert("", "end", iid=snap.id, text=snap.label, values=values)
+        if snap.status == "running":
+            self.progress.configure(value=snap.progress * 100)
+            self.var_status.set(snap.message or "Đang xử lý…")
+        elif snap.status == "cancelled":
+            self.var_status.set("Tác vụ đã hủy")
+        elif snap.status == "failed":
+            self.var_status.set("Tác vụ thất bại")
+            if snap.error:
+                self._log(snap.error)
 
     def _on_progress(self, stage: str, fraction: float, message: str) -> None:
         self._queue.put(("progress", stage, fraction, message))
@@ -1343,7 +1388,16 @@ class App(_BaseTk):  # type: ignore[misc, valid-type]
                 item = self._queue.get_nowait()
                 kind = item[0]
 
-                if kind == "progress":
+                if kind == "job_state":
+                    _, snap = item
+                    self._upsert_job(snap)
+
+                elif kind == "job_result":
+                    _, cfg, result = item
+                    self.progress.configure(value=100)
+                    self._handle_done(cfg, result)
+
+                elif kind == "progress":
                     _, stage, fraction, message = item
                     self.progress.configure(value=max(0, min(100, fraction * 100)))
                     self.var_status.set(
@@ -1411,7 +1465,7 @@ def _format_time(t: float) -> str:
         t = 0.0
     minutes = int(t // 60)
     seconds = t - minutes * 60
-    return f"{minutes:02d}:{seconds:05.2f}"
+    return f"{minutes:02d}:{seconds:06.3f}"
 
 
 def _translate_stage(stage: str) -> str:

@@ -43,4 +43,4 @@ python video_cutter.py -i input.mp4 --probe
 
 ## Dependencies
 
-The root project requirements already include the dependencies needed by this tool, including `imageio-ffmpeg` for a bundled FFmpeg runtime.
+The root project requirements include `imageio-ffmpeg` as one FFmpeg discovery fallback. The project does not bundle an FFmpeg executable by policy; any distributed FFmpeg binary requires separate license/provenance review of that exact build.

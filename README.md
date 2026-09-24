@@ -17,6 +17,8 @@ The project combines two related tools:
 - Optional output-size target that iteratively reduces GIF weight.
 - Transparent or solid backgrounds.
 - CLI and Tkinter GUI.
+- Sequential multi-job queue with per-job state/progress/cancel.
+- Pre-encode size estimate for planning before expensive work.
 
 ## Video cutter highlights
 
@@ -26,6 +28,9 @@ The project combines two related tools:
 - Optional audio removal.
 - Metadata probe mode.
 - Timeline-based desktop GUI and CLI.
+- Millisecond timecode plus one-frame stepping in the cutter GUI.
+- Real FFmpeg process cancellation with partial-output cleanup.
+- Pre-cut size estimate for copy and precise modes.
 
 ## Requirements
 
@@ -36,7 +41,7 @@ The project combines two related tools:
 python -m pip install -r requirements.txt
 ```
 
-The video cutter uses the FFmpeg binary distributed through `imageio-ffmpeg`, so a separate system-wide FFmpeg installation is not required for the normal setup.
+Media-tool discovery checks an explicitly configured path, `WAHU_FFMPEG_PATH` / `WAHU_FFPROBE_PATH`, the system `PATH`, and finally the `imageio-ffmpeg` FFmpeg fallback. Candidates are verified with `-version` before use. Release packages must not bundle an FFmpeg binary without an explicit license/provenance review of that exact build.
 
 ## Run
 
@@ -96,14 +101,18 @@ python video_cutter\video_cutter.py -i long.mp4 --start 60 --end 90 -o excerpt.m
 
 ```powershell
 python gif_tool.py --list-presets
-python -m compileall -q gif_tool.py gif_gui.py video_cutter
+python -m unittest discover -s tests -v
+python benchmarks/benchmark_core.py
+python -m compileall -q media_runtime.py media_job_queue.py gif_tool.py gif_gui.py video_cutter tests benchmarks
 ```
 
-CI runs those checks on Windows.
+CI runs preset smoke, focused unit tests, benchmark smoke and compile checks on Windows.
 
 ## Project layout
 
 ```text
+media_runtime.py
+media_job_queue.py
 gif_tool.py
 gif_gui.py
 video_cutter/

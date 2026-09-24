@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 GIF Maker.
 
@@ -19,6 +19,8 @@ import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
+
+from media_runtime import CancelledError, CancellationToken, estimate_gif_bytes
 
 try:
     import cv2
@@ -515,7 +517,7 @@ def resize_with_fit(
 # ---------------------------------------------------------------------------
 
 
-def extract_from_video(cfg: BuildConfig, on_progress: Optional[ProgressCallback] = None) -> List[Image.Image]:
+def extract_from_video(cfg: BuildConfig, on_progress: Optional[ProgressCallback] = None, cancel_token: Optional[CancellationToken] = None) -> List[Image.Image]:
     cap = cv2.VideoCapture(str(cfg.input_path))
     if not cap.isOpened():
         raise SystemExit(f"Cannot open video: {cfg.input_path}")
@@ -539,7 +541,9 @@ def extract_from_video(cfg: BuildConfig, on_progress: Optional[ProgressCallback]
     frames: List[Image.Image] = []
     index = 0
 
+    token = cancel_token or CancellationToken()
     while True:
+        token.raise_if_cancelled()
         ok, frame = cap.read()
         if not ok:
             break
@@ -574,11 +578,13 @@ def extract_from_video(cfg: BuildConfig, on_progress: Optional[ProgressCallback]
     return frames
 
 
-def extract_from_gif(cfg: BuildConfig, on_progress: Optional[ProgressCallback] = None) -> List[Image.Image]:
+def extract_from_gif(cfg: BuildConfig, on_progress: Optional[ProgressCallback] = None, cancel_token: Optional[CancellationToken] = None) -> List[Image.Image]:
+    token = cancel_token or CancellationToken()
     with Image.open(cfg.input_path) as im:
         raw_frames: List[Image.Image] = []
         durations: List[float] = []
         for frm in ImageSequence.Iterator(im):
+            token.raise_if_cancelled()
             raw_frames.append(frm.convert("RGBA"))
             duration_ms = frm.info.get("duration", im.info.get("duration", 100))
             durations.append(max(10, int(duration_ms)) / 1000.0)
@@ -598,6 +604,7 @@ def extract_from_gif(cfg: BuildConfig, on_progress: Optional[ProgressCallback] =
     t = 0.0
 
     for idx, (frm, dur) in enumerate(zip(raw_frames, durations)):
+        token.raise_if_cancelled()
         frame_start = t
         frame_end = t + dur
         t = frame_end
@@ -619,7 +626,9 @@ def extract_from_gif(cfg: BuildConfig, on_progress: Optional[ProgressCallback] =
     return frames
 
 
-def extract_from_image(cfg: BuildConfig, on_progress: Optional[ProgressCallback] = None) -> List[Image.Image]:
+def extract_from_image(cfg: BuildConfig, on_progress: Optional[ProgressCallback] = None, cancel_token: Optional[CancellationToken] = None) -> List[Image.Image]:
+    token = cancel_token or CancellationToken()
+    token.raise_if_cancelled()
     with Image.open(cfg.input_path) as im:
         frame = apply_layout(im.convert("RGBA"), cfg)
     if on_progress:
@@ -627,7 +636,8 @@ def extract_from_image(cfg: BuildConfig, on_progress: Optional[ProgressCallback]
     return [frame, frame.copy()]
 
 
-def extract_from_sequence(cfg: BuildConfig, on_progress: Optional[ProgressCallback] = None) -> List[Image.Image]:
+def extract_from_sequence(cfg: BuildConfig, on_progress: Optional[ProgressCallback] = None, cancel_token: Optional[CancellationToken] = None) -> List[Image.Image]:
+    token = cancel_token or CancellationToken()
     files = collect_sequence_images(cfg.input_path)
 
     source_fps = 30.0
@@ -649,6 +659,7 @@ def extract_from_sequence(cfg: BuildConfig, on_progress: Optional[ProgressCallba
     frames: List[Image.Image] = []
 
     for idx, file_path in enumerate(selected_files):
+        token.raise_if_cancelled()
         current_time = (start_index + idx) / source_fps
         if current_time + 1e-9 < next_capture_time:
             continue
@@ -668,19 +679,19 @@ def extract_from_sequence(cfg: BuildConfig, on_progress: Optional[ProgressCallba
     return frames
 
 
-def extract_frames(cfg: BuildConfig, on_progress: Optional[ProgressCallback] = None) -> List[Image.Image]:
+def extract_frames(cfg: BuildConfig, on_progress: Optional[ProgressCallback] = None, cancel_token: Optional[CancellationToken] = None) -> List[Image.Image]:
     kind = discover_input_kind(cfg.input_path)
 
     if on_progress:
         on_progress("decode", 0.0, f"Reading input ({kind})")
 
     if kind == "video":
-        return extract_from_video(cfg, on_progress)
+        return extract_from_video(cfg, on_progress, cancel_token)
     if kind == "gif":
-        return extract_from_gif(cfg, on_progress)
+        return extract_from_gif(cfg, on_progress, cancel_token)
     if kind == "sequence":
-        return extract_from_sequence(cfg, on_progress)
-    return extract_from_image(cfg, on_progress)
+        return extract_from_sequence(cfg, on_progress, cancel_token)
+    return extract_from_image(cfg, on_progress, cancel_token)
 
 
 # ---------------------------------------------------------------------------
@@ -779,6 +790,7 @@ def quantize_frames(
     on_progress: Optional[ProgressCallback] = None,
     palette_mode: str = "global",
     background: Optional[Tuple[int, int, int, int]] = None,
+    cancel_token: Optional[CancellationToken] = None,
 ) -> List[Image.Image]:
     """Quantize danh sách frame.
 
@@ -789,6 +801,7 @@ def quantize_frames(
     palette_mode='per_frame': mỗi frame có palette riêng. Linh hoạt hơn cho
     cảnh đổi màu mạnh nhưng dễ flicker và file thường lớn hơn.
     """
+    token = cancel_token or CancellationToken()
     out: List[Image.Image] = []
     total = max(1, len(frames))
 
@@ -799,6 +812,7 @@ def quantize_frames(
 
         bg = None if keep_alpha else (background if background else (0, 0, 0, 255))
         for i, frm in enumerate(frames):
+            token.raise_if_cancelled()
             flat = _flatten_for_palette(frm, bg)
             if flat.mode == "RGBA":
                 flat = flat.convert("RGB")
@@ -812,6 +826,7 @@ def quantize_frames(
     method = _QUANTIZE_METHOD
     bg = None if keep_alpha else (background if background else (0, 0, 0, 255))
     for i, frm in enumerate(frames):
+        token.raise_if_cancelled()
         flat = _flatten_for_palette(frm, bg)
         if method == Image.Quantize.LIBIMAGEQUANT and flat.mode != "RGBA":
             flat = flat.convert("RGBA")
@@ -854,31 +869,54 @@ def file_size_mb(path: Path) -> float:
     return path.stat().st_size / (1024 * 1024)
 
 
+def _raise_if_cancelled_cleanup(token: CancellationToken, output_path: Path) -> None:
+    if not token.cancelled:
+        return
+    try:
+        if output_path.exists():
+            output_path.unlink()
+    except OSError:
+        pass
+    raise CancelledError("Đã hủy tác vụ")
+
+
 # ---------------------------------------------------------------------------
 # High-level pipeline
 # ---------------------------------------------------------------------------
 
 
-def build_gif(cfg: BuildConfig, on_progress: Optional[ProgressCallback] = None) -> BuildResult:
+def estimate_gif_size(cfg: BuildConfig, source_width: int, source_height: int, source_duration: float) -> int:
+    width = cfg.width or source_width
+    height = cfg.height or source_height
+    duration = (cfg.end - cfg.start) if cfg.end is not None else max(0.0, source_duration - cfg.start)
+    frames = min(cfg.max_frames, max(1, int(round(max(0.0, duration) * cfg.fps / max(cfg.speed, 1e-6)))))
+    return estimate_gif_bytes(width, height, frames, cfg.colors, cfg.palette_mode)
+
+
+def build_gif(cfg: BuildConfig, on_progress: Optional[ProgressCallback] = None, cancel_token: Optional[CancellationToken] = None) -> BuildResult:
     """End-to-end pipeline. Used by both CLI and GUI."""
 
-    frames = extract_frames(cfg, on_progress)
+    token = cancel_token or CancellationToken()
+    token.raise_if_cancelled()
+    frames = extract_frames(cfg, on_progress, token)
     if not frames:
         raise SystemExit("No frames generated. Check input and trim settings.")
 
     if cfg.max_size_mb is not None and cfg.optimize:
-        return _encode_with_size_target(frames, cfg, on_progress)
+        return _encode_with_size_target(frames, cfg, on_progress, token)
 
     if on_progress:
         on_progress("quantize", 0.0, "Quantizing colors")
     q_frames = quantize_frames(
         frames, cfg.colors, cfg.dither, cfg.keep_alpha, on_progress,
-        palette_mode=cfg.palette_mode, background=cfg.background,
+        palette_mode=cfg.palette_mode, background=cfg.background, cancel_token=token,
     )
 
+    token.raise_if_cancelled()
     if on_progress:
         on_progress("encode", 0.5, "Writing GIF")
     write_gif(q_frames, cfg.output_path, cfg.fps, cfg.loop, optimize=cfg.optimize)
+    _raise_if_cancelled_cleanup(token, cfg.output_path)
 
     if on_progress:
         on_progress("done", 1.0, "Finished")
@@ -919,6 +957,7 @@ def _encode_with_size_target(
     frames: List[Image.Image],
     cfg: BuildConfig,
     on_progress: Optional[ProgressCallback] = None,
+    cancel_token: Optional[CancellationToken] = None,
 ) -> BuildResult:
     """Iteratively reduce colors, fps, and dimensions to hit max_size_mb.
 
@@ -926,6 +965,7 @@ def _encode_with_size_target(
     proportional to how far we are from the target. Stop early on success.
     """
 
+    token = cancel_token or CancellationToken()
     work_frames = frames
     work_fps = cfg.fps
     work_colors = cfg.colors
@@ -942,6 +982,7 @@ def _encode_with_size_target(
     last_size_mb = float("inf")
 
     for r in range(rounds):
+        token.raise_if_cancelled()
         if on_progress:
             on_progress(
                 "optimize",
@@ -955,9 +996,11 @@ def _encode_with_size_target(
 
         q_frames = quantize_frames(
             work_frames, work_colors, cfg.dither, cfg.keep_alpha, None,
-            palette_mode=cfg.palette_mode, background=cfg.background,
+            palette_mode=cfg.palette_mode, background=cfg.background, cancel_token=token,
         )
+        token.raise_if_cancelled()
         write_gif(q_frames, cfg.output_path, work_fps, cfg.loop, optimize=cfg.optimize)
+        _raise_if_cancelled_cleanup(token, cfg.output_path)
         size_mb = file_size_mb(cfg.output_path)
 
         last_q_frames = q_frames

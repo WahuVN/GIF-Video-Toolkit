@@ -34,10 +34,12 @@ from gif_gui import MediaSource, RangeSlider  # type: ignore  # noqa: E402
 from video_cutter import (  # noqa: E402
     CutOptions,
     cut_video,
+    estimate_cut_size,
     format_time,
     parse_timecode,
     probe,
 )
+from media_job_queue import JobSnapshot, SerialJobQueue
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD  # type: ignore
@@ -78,6 +80,7 @@ class CutterApp(_BaseTk):  # type: ignore[misc, valid-type]
 
         self._queue: "queue.Queue[tuple]" = queue.Queue()
         self._worker: Optional[threading.Thread] = None
+        self._job_queue = SerialJobQueue(lambda snap: self._queue.put(("job_state", snap)))
         self._media: Optional[MediaSource] = None
         self._preview_imgtk: Optional[ImageTk.PhotoImage] = None
 
@@ -181,8 +184,10 @@ class CutterApp(_BaseTk):  # type: ignore[misc, valid-type]
         ttk.Separator(controls, orient="vertical").pack(side="left", fill="y", padx=8)
 
         ttk.Button(controls, text="−1s", width=4, command=lambda: self._seek_relative(-1.0)).pack(side="left")
+        ttk.Button(controls, text="−1f", width=4, command=lambda: self._seek_frames(-1)).pack(side="left", padx=2)
         ttk.Button(controls, text="−0.1s", width=5, command=lambda: self._seek_relative(-0.1)).pack(side="left", padx=2)
         ttk.Button(controls, text="+0.1s", width=5, command=lambda: self._seek_relative(0.1)).pack(side="left")
+        ttk.Button(controls, text="+1f", width=4, command=lambda: self._seek_frames(1)).pack(side="left", padx=2)
         ttk.Button(controls, text="+1s", width=4, command=lambda: self._seek_relative(1.0)).pack(side="left", padx=2)
 
         ttk.Separator(controls, orient="vertical").pack(side="left", fill="y", padx=8)
@@ -305,11 +310,13 @@ class CutterApp(_BaseTk):  # type: ignore[misc, valid-type]
         # Hành động + tiến trình
         action = ttk.Frame(right)
         action.grid(row=4, column=0, sticky="ew", pady=(8, 4))
-        self.btn_run = ttk.Button(action, text="✂  Cắt video", command=self._on_run)
+        self.btn_run = ttk.Button(action, text="＋  Thêm vào hàng đợi", command=self._on_run)
         self.btn_run.pack(side="left", padx=2)
         self.btn_open = ttk.Button(action, text="📁  Mở thư mục kết quả",
                                    command=self._open_output_folder, state="disabled")
         self.btn_open.pack(side="left", padx=6)
+        self.btn_cancel_job = ttk.Button(action, text="■  Hủy tác vụ chọn", command=self._cancel_selected_job)
+        self.btn_cancel_job.pack(side="left", padx=2)
         ttk.Button(action, text="↺  Đặt lại form", command=self._reset_form).pack(side="right", padx=2)
 
         self.progress = ttk.Progressbar(right, mode="determinate")
@@ -317,9 +324,24 @@ class CutterApp(_BaseTk):  # type: ignore[misc, valid-type]
         self.var_status = tk.StringVar(value="Sẵn sàng")
         ttk.Label(right, textvariable=self.var_status).grid(row=6, column=0, sticky="ew", pady=(2, 6))
 
+        # Hàng đợi tác vụ
+        queue_frame = ttk.LabelFrame(root, text="Hàng đợi tác vụ")
+        queue_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        queue_frame.columnconfigure(0, weight=1)
+        self.job_tree = ttk.Treeview(queue_frame, columns=("status", "progress", "message"), show="tree headings", height=4)
+        self.job_tree.heading("#0", text="Tác vụ")
+        self.job_tree.heading("status", text="Trạng thái")
+        self.job_tree.heading("progress", text="Tiến độ")
+        self.job_tree.heading("message", text="Chi tiết")
+        self.job_tree.column("#0", width=280)
+        self.job_tree.column("status", width=90, anchor="center")
+        self.job_tree.column("progress", width=80, anchor="center")
+        self.job_tree.column("message", width=420)
+        self.job_tree.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
+
         # Log
         log_frame = ttk.LabelFrame(root, text="Nhật ký")
-        log_frame.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+        log_frame.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
         log_frame.columnconfigure(0, weight=1)
         self.txt_log = tk.Text(log_frame, height=7, wrap="word")
         self.txt_log.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
@@ -376,6 +398,8 @@ class CutterApp(_BaseTk):  # type: ignore[misc, valid-type]
         self.bind_all("<KeyPress-Right>", guarded(lambda: self._seek_relative(0.1)))
         self.bind_all("<Shift-KeyPress-Left>", guarded(lambda: self._seek_relative(-1.0)))
         self.bind_all("<Shift-KeyPress-Right>", guarded(lambda: self._seek_relative(1.0)))
+        self.bind_all("<Control-KeyPress-Left>", guarded(lambda: self._seek_frames(-1)))
+        self.bind_all("<Control-KeyPress-Right>", guarded(lambda: self._seek_frames(1)))
 
     # ------------------------------------------------------------------
     # File pickers
@@ -607,6 +631,14 @@ class CutterApp(_BaseTk):  # type: ignore[misc, valid-type]
         self._stop_play()
         self._seek_to(self._cursor_time + delta)
 
+    def _seek_frames(self, frames: int) -> None:
+        if self._media is None:
+            return
+        fps = self._media.fps if self._media.fps > 0 else 30.0
+        self._stop_play()
+        target_frame = round(self._cursor_time * fps) + frames
+        self._seek_to(max(0.0, target_frame / fps))
+
     def _goto_time(self) -> Optional[float]:
         if self._media is None:
             self.var_status.set("Hãy chọn một video trước.")
@@ -791,8 +823,6 @@ class CutterApp(_BaseTk):  # type: ignore[misc, valid-type]
         )
 
     def _on_run(self) -> None:
-        if self._worker and self._worker.is_alive():
-            return
         try:
             opts = self._build_options()
         except Exception as exc:
@@ -808,28 +838,50 @@ class CutterApp(_BaseTk):  # type: ignore[misc, valid-type]
             opts.overwrite = True
 
         self._stop_play()
-        self.btn_run.configure(state="disabled")
         self.btn_open.configure(state="disabled")
         self.progress.configure(value=0)
-        self._log_clear()
-        self._log(f"Cắt video: {opts.input_path}")
-        self._log(f"Đoạn: {format_time(opts.start)} → {format_time(opts.end)} "
-                  f"({format_time(opts.end - opts.start)})")
-        self._log(f"Đầu ra: {opts.output_path}")
-        self._log(f"Chế độ: {opts.mode} · Tiếng: {'có' if opts.keep_audio else 'không'}")
-        self.var_status.set("Đang cắt video…")
+        try:
+            estimate = estimate_cut_size(opts)
+        except Exception:
+            estimate = 0
+        label = f"Video · {opts.input_path.name} → {opts.output_path.name}"
 
-        def worker() -> None:
+        def runner(token, progress) -> None:
             t0 = time.time()
-            try:
-                cut_video(opts, on_progress=self._on_progress)
-                elapsed = time.time() - t0
-                self._queue.put(("done", opts, elapsed))
-            except Exception:
-                self._queue.put(("error", traceback.format_exc()))
+            cut_video(opts, on_progress=progress, cancel_token=token)
+            elapsed = time.time() - t0
+            self._queue.put(("job_result", opts, elapsed))
 
-        self._worker = threading.Thread(target=worker, daemon=True)
-        self._worker.start()
+        job_id = self._job_queue.submit(label, runner)
+        self._log(f"Đã xếp {job_id}: {label}")
+        self._log(f"Đoạn: {format_time(opts.start)} → {format_time(opts.end)} ({format_time(opts.end - opts.start)})")
+        if estimate:
+            self._log(f"Ước lượng trước encode: ≈ {estimate / (1024 * 1024):.2f} MB")
+        self.var_status.set("Đã thêm tác vụ vào hàng đợi")
+
+    def _cancel_selected_job(self) -> None:
+        selected = self.job_tree.selection()
+        if not selected:
+            self.var_status.set("Chọn một tác vụ trong hàng đợi để hủy.")
+            return
+        self._job_queue.cancel(selected[0])
+
+    def _upsert_job(self, snap: JobSnapshot) -> None:
+        status_vi = {"queued":"Chờ", "running":"Đang chạy", "done":"Xong", "failed":"Lỗi", "cancelled":"Đã hủy"}.get(snap.status, snap.status)
+        values = (status_vi, f"{snap.progress * 100:.0f}%", snap.message)
+        if self.job_tree.exists(snap.id):
+            self.job_tree.item(snap.id, text=snap.label, values=values)
+        else:
+            self.job_tree.insert("", "end", iid=snap.id, text=snap.label, values=values)
+        if snap.status == "running":
+            self.progress.configure(value=snap.progress * 100)
+            self.var_status.set(snap.message or "Đang cắt video…")
+        elif snap.status == "cancelled":
+            self.var_status.set("Tác vụ đã hủy")
+        elif snap.status == "failed":
+            self.var_status.set("Tác vụ thất bại")
+            if snap.error:
+                self._log(snap.error)
 
     def _on_progress(self, fraction: float, message: str) -> None:
         self._queue.put(("progress", fraction, message))
@@ -840,7 +892,16 @@ class CutterApp(_BaseTk):  # type: ignore[misc, valid-type]
                 item = self._queue.get_nowait()
                 kind = item[0]
 
-                if kind == "progress":
+                if kind == "job_state":
+                    _, snap = item
+                    self._upsert_job(snap)
+
+                elif kind == "job_result":
+                    _, opts, elapsed = item
+                    self.progress.configure(value=100)
+                    self._handle_done(opts, elapsed)
+
+                elif kind == "progress":
                     _, fraction, message = item
                     self.progress.configure(value=max(0, min(100, fraction * 100)))
                     self.var_status.set(message)
